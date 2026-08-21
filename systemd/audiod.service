@@ -1,0 +1,19 @@
+[Unit]
+Description=audiod audio server (ALSA ioctl or direct HDA)
+After=sound.target local-fs.target
+Wants=sound.target
+
+[Service]
+Type=simple
+# HDA backend requires root + the kernel driver unbound from the PCI slot:
+#   echo 0000:00:1b.0 > /sys/bus/pci/drivers/snd_hda_intel/unbind
+ExecStart=/home/ssava/Desktop/Code/audiod/target/release/audiod -d hda
+User=root
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

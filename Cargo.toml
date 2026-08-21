@@ -1,0 +1,3 @@
+[workspace]
+members = ["common", "server", "shim", "ctl", "hda"]
+resolver = "2"
