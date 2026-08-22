@@ -2,7 +2,8 @@
 
 The `hda/` crate is a minimal userspace Intel HD-Audio (Azalia) driver. It
 replaces the kernel ALSA ioctl path entirely: audiod mmaps the PCI BAR, brings
-up the link, programs the codec with PIO verbs, and feeds a pinned DMA ring.
+up the link, programs the codec over CORB/RIRB (PIO fallback), and feeds a
+pinned DMA ring.
 
 ## Module map
 
@@ -13,7 +14,8 @@ up the link, programs the codec with PIO verbs, and feeds a pinned DMA ring.
 | `pagemap.rs` | `mlock` + `/proc/self/pagemap` PFN → physical address for DMA buffers |
 | `bdl.rs` | Buffer Descriptor List entries |
 | `pcicfg.rs` | PCI config: bus-master enable, TCSEL, SCH NOSNOOP |
-| `controller.rs` | Link reset, STATESTS codec detect, PIO command/response via IC/IR/IRS |
+| `corb.rs` | CORB/RIRB DMA command/response rings (default codec transport) |
+| `controller.rs` | Link reset, STATESTS codec detect, command engine dispatch (CORB/RIRB or PIO IC/IR/IRS fallback) |
 | `stream.rs` | Playback SD setup/start/stop/SRST, 64-page DMA ring, LPIB delay |
 | `codec.rs` | ALC269VC probe + playback path init (DAC→Mux→Pin), topology dump |
 | `dbg.rs` | Debug options (CLI flags, legacy env fallback) |
@@ -26,7 +28,9 @@ up the link, programs the codec with PIO verbs, and feeds a pinned DMA ring.
    The kernel normally does this in probe; an unbound device has it cleared,
    and without it DMA never fetches (LPIB stays 0).
 3. **Link reset** — CRST cycle, wait for codec detection in STATESTS.
-4. **Codec probe** — read vendor ID via PIO verbs; validate the hardcoded
+4. **Codec probe** — read vendor ID via codec verbs (CORB/RIRB by default,
+   `--cmd-engine=pio` for the legacy immediate-command interface); validate
+   the hardcoded
    ALC269VC node map (widget types must match: DACs=OUT, muxes=MIX/SEL,
    pins=PIN) and fail loudly on anything else.
 5. **Stream setup** — SRST the playback SD, program format/tag/BDL/CBL/LVI.
@@ -88,5 +92,12 @@ resampled ([architecture.md](architecture.md#dsp-pipeline-server-srcdsprs)).
   `scripts/audiod-hda.sh stop` rebinds it to restore desktop audio.
 - Codec support is hardcoded to Realtek ALC269VC. Other codecs fail at probe
   with a clear error rather than programming wrong widgets.
-- No CORB/RIRB: commands use the legacy immediate-command (IC/IR/IRS) engine.
+- **Command engine**: CORB/RIRB DMA rings by default (one shared pinned page:
+  CORB 256×4 B at offset 0, RIRB 256×8 B at 1 KiB; sizes negotiated 256→16→2
+  with readback verification). Responses are polled from RIRBWP — no
+  interrupts. Unsolicited responses and foreign-codec entries are logged and
+  skipped (jack-detect groundwork). After 3 consecutive response timeouts or a
+  hard ring error, audiod degrades to the legacy PIO immediate-command engine
+  once, re-issues the timed-out verb through it, and stays there. PIO is also
+  selectable up-front with `--cmd-engine=pio`.
 - Playback only; no capture streams.

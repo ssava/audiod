@@ -83,10 +83,16 @@ pub struct Resampler {
     /// Position advance per output frame: `step_num / step_den` input frames.
     step_num: u64,
     step_den: u64,
-    /// Position of the next output frame relative to `hist[0]`, in
-    /// `step_den`-ths of an input frame.
+    /// Position of the next output frame relative to the LOGICAL origin of
+    /// the stream, in `step_den`-ths of an input frame. The logical origin
+    /// never moves; physical erasure of consumed history is tracked by `off`.
     pos: u64,
     hist: Vec<f32>,
+    /// Frames logically consumed but still present at the front of `hist`.
+    /// Erasure is deferred until this prefix dominates the buffer so a chunk
+    /// costs O(chunk) instead of paying a full `drain` memmove of the whole
+    /// retained history on every call.
+    off: usize,
 }
 
 impl Resampler {
@@ -106,6 +112,7 @@ impl Resampler {
             step_den: dst as u64 / g,
             pos: 0,
             hist: Vec::new(),
+            off: 0,
         })
     }
 
@@ -114,9 +121,12 @@ impl Resampler {
     pub fn resample(&mut self, input: &[f32], out: &mut Vec<f32>) -> usize {
         debug_assert_eq!(input.len() % 2, 0);
         self.hist.extend_from_slice(input);
-        let frames = self.hist.len() / 2;
+        let frames = self.hist.len() / 2; // physical frames incl. consumed prefix
         let mut produced = 0usize;
         loop {
+            // pos is anchored at the stream's logical origin and never
+            // rebased; the consumed prefix is still physically present in
+            // hist, so this index addresses hist directly.
             let base = (self.pos / self.step_den) as usize;
             if base + TAPS > frames {
                 break;
@@ -130,13 +140,14 @@ impl Resampler {
                     let t = pf - p0 as f32;
                     let r0 = tab.row(p0);
                     let r1 = tab.row(p1);
-                    let mut l = 0f32;
-                    let mut r = 0f32;
-                    for k in 0..TAPS {
-                        let c = r0[k] + (r1[k] - r0[k]) * t;
-                        let s = (base + k) * 2;
-                        l += c * self.hist[s];
-                        r += c * self.hist[s + 1];
+                    // One bounds check for the whole tap window; the zip lets
+                    // the compiler reason about all three slices at once.
+                    let win = &self.hist[base * 2..(base + TAPS) * 2];
+                    let (mut l, mut r) = (0f32, 0f32);
+                    for (pair, (c0, c1)) in win.chunks_exact(2).zip(r0.iter().zip(r1.iter())) {
+                        let c = c0 + (c1 - c0) * t;
+                        l += c * pair[0];
+                        r += c * pair[1];
                     }
                     (l, r)
                 }
@@ -155,14 +166,21 @@ impl Resampler {
             self.pos += self.step_num;
         }
         // Retire consumed frames, keeping enough context for the next output.
+        // `off` only grows; the physical memmove happens when the dead prefix
+        // outweighs the live tail, so the cost stays O(input) amortized.
+        // Integer position math is unchanged, keeping output bit-identical
+        // to eager draining (see `chunk_split_invariance`).
         let keep = match self.kind {
             Kind::Sinc(_) => TAPS - 1,
             Kind::Linear => 1,
         };
-        let consumed = (self.pos / self.step_den).min(frames.saturating_sub(keep) as u64);
-        if consumed > 0 {
-            self.hist.drain(..consumed as usize * 2);
-            self.pos -= consumed * self.step_den;
+        let consumed = (self.pos / self.step_den).min(frames.saturating_sub(keep) as u64) as usize;
+        if consumed > self.off {
+            self.off = consumed;
+        }
+        if self.off * 2 > self.hist.len() {
+            self.hist.drain(..self.off * 2);
+            self.off = 0;
         }
         produced
     }
@@ -374,10 +392,10 @@ mod tests {
         r.resample(&sine(44100.0, 11000.0, 0.8, 0.25), &mut out);
         let lch = left(&out);
         let o = trim(&lch);
-        let img = goertzel(&o, 48000.0, 33100.0);
+        let img = goertzel(o, 48000.0, 33100.0);
         let db = 20.0 * (img / 0.8).log10();
         assert!(db < -50.0, "image at 33.1 kHz: {img:.5} ({db:.1} dB)");
-        let tone = goertzel(&o, 48000.0, 11000.0);
+        let tone = goertzel(o, 48000.0, 11000.0);
         assert!((0.755..=0.845).contains(&tone), "tone amplitude {tone:.4}");
     }
 

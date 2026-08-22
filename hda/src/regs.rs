@@ -54,6 +54,22 @@ pub const RIRBCTL_IRQ_EN: u8 = 1 << 0;
 pub const RIRBCTL_DMA_EN: u8 = 1 << 1;
 pub const RINTERRUPT_MASK: u8 = 0x05;
 
+/// CORBSTS (0x4d): bit 0 = CORB memory error indication (W1C).
+pub const CORBSTS_MEI: u8 = 1 << 0;
+
+/// CORBSIZE/RIRBSIZE (bits 6:4): which ring sizes the controller supports.
+pub const SIZE_CAP_2: u8 = 1 << 4;
+pub const SIZE_CAP_16: u8 = 1 << 5;
+pub const SIZE_CAP_256: u8 = 1 << 6;
+/// Programmed size encoding (bits 1:0).
+pub const SIZE_2: u8 = 0b00;
+pub const SIZE_16: u8 = 0b01;
+pub const SIZE_256: u8 = 0b10;
+
+/// RIRB response-ex flags (upper dword of each entry).
+pub const RIRB_EX_UNSOL: u32 = 1 << 4;
+pub const RIRB_EX_CAD_MASK: u32 = 0xf;
+
 pub const IRS_VALID: u16 = 1 << 1;
 pub const IRS_BUSY: u16 = 1 << 0;
 

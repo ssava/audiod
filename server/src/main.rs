@@ -451,13 +451,24 @@ fn reader_client(mut stream: UnixStream, cfg: AudioCfg, mixer: Mixer, max_client
 
     let srv = load_config();
     let mut resampler = Resampler::new(cfg.rate, srv.server.mix_rate, &srv.server.resampler);
+    // The common desktop case (S16LE stereo already at the mix rate) needs no
+    // DSP at all: volume/mute are applied by the mixer downstream, so the raw
+    // frames go into the stream ring verbatim. Skips the i16→f32→i16 round
+    // trip (fold + pack measured at ~8% of server CPU) and its buffer churn.
+    let direct = cfg.format == FORMAT_S16_LE && cfg.channels == 2 && cfg.rate == srv.server.mix_rate;
     info!(
         "client connected (rate={} ch={} fmt={}) → mix {} Hz S16 stereo{}",
         cfg.rate,
         cfg.channels,
         cfg.format,
         srv.server.mix_rate,
-        if resampler.is_some() { ", resampled" } else { "" }
+        if direct {
+            ", direct"
+        } else if resampler.is_some() {
+            ", resampled"
+        } else {
+            ""
+        }
     );
 
     let mstream = mixer.register();
@@ -538,6 +549,16 @@ fn reader_client(mut stream: UnixStream, cfg: AudioCfg, mixer: Mixer, max_client
         }
         if data.len() != len {
             break;
+        }
+
+        if direct {
+            if len.is_multiple_of(4) {
+                mstream.ring.push(&data);
+                STATE
+                    .total_frames
+                    .fetch_add((len / 4) as u64, Ordering::Release);
+            }
+            continue;
         }
 
         // Client bytes → f32 stereo → mix rate → S16LE stereo.
@@ -745,6 +766,7 @@ fn usage() {
     eprintln!("  --dump-state       Dump codec register state after init");
     eprintln!("  --dump-topology    Dump the codec widget graph");
     eprintln!("  --dump-ring        Hexdump the first DMA ring bytes fed");
+    eprintln!("  --cmd-engine=E     Codec command engine: corb (default) or pio");
 }
 
 fn main() {
@@ -776,6 +798,16 @@ fn main() {
             "--dump-state" => dbg.dump_state = true,
             "--dump-ring" => dbg.dump_ring = true,
             "--dump-topology" => dbg.dump_topology = true,
+            a if a.starts_with("--cmd-engine=") => {
+                dbg.cmd_engine = match &a["--cmd-engine=".len()..] {
+                    "corb" => Some(audhda::dbg::CmdEngineKind::Corb),
+                    "pio" => Some(audhda::dbg::CmdEngineKind::Pio),
+                    other => {
+                        error!("unknown --cmd-engine '{other}' (expected corb or pio)");
+                        std::process::exit(2);
+                    }
+                };
+            }
             a if a.starts_with('-') => positional.push(args[i].clone()),
             _ => positional.push(args[i].clone()),
         }

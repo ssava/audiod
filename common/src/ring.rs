@@ -56,26 +56,30 @@ impl AudioRingBuffer {
         if data.is_empty() {
             return;
         }
-        let mut inner = self.inner.lock().unwrap();
-        while self.filled.load(Ordering::Acquire) + data.len() > self.cap {
-            inner = self.space_avail.wait(inner).unwrap();
+        {
+            let mut inner = self.inner.lock().unwrap();
+            while self.filled.load(Ordering::Acquire) + data.len() > self.cap {
+                inner = self.space_avail.wait(inner).unwrap();
+            }
+            let cap = self.cap;
+            let write_pos = inner.write_pos;
+            let space_to_end = cap - write_pos;
+            let first = data.len().min(space_to_end);
+            inner.buf[write_pos..write_pos + first].copy_from_slice(&data[..first]);
+            if first < data.len() {
+                let remaining = &data[first..];
+                inner.buf[..remaining.len()].copy_from_slice(remaining);
+                inner.write_pos = remaining.len();
+            } else {
+                inner.write_pos = write_pos + first;
+            }
+            if inner.write_pos >= cap {
+                inner.write_pos -= cap;
+            }
+            self.filled.fetch_add(data.len(), Ordering::Release);
         }
-        let cap = self.cap;
-        let write_pos = inner.write_pos;
-        let space_to_end = cap - write_pos;
-        let first = data.len().min(space_to_end);
-        inner.buf[write_pos..write_pos + first].copy_from_slice(&data[..first]);
-        if first < data.len() {
-            let remaining = &data[first..];
-            inner.buf[..remaining.len()].copy_from_slice(remaining);
-            inner.write_pos = remaining.len();
-        } else {
-            inner.write_pos = write_pos + first;
-        }
-        if inner.write_pos >= cap {
-            inner.write_pos -= cap;
-        }
-        self.filled.fetch_add(data.len(), Ordering::Release);
+        // Wake after dropping the lock so the woken thread doesn't have to
+        // contend for the mutex it saw held (hurry-up-and-wait).
         self.data_avail.notify_one();
     }
 
@@ -111,32 +115,40 @@ impl AudioRingBuffer {
     /// Pop up to `buf.len()` bytes from the ring into `buf`.
     /// Returns the number of bytes written, or 0 if interrupted.
     pub fn pop(&self, buf: &mut [u8]) -> usize {
-        let mut inner = self.inner.lock().unwrap();
-        loop {
-            if self.interrupted.swap(false, Ordering::AcqRel) {
-                return 0;
+        let inner = {
+            let mut inner = self.inner.lock().unwrap();
+            loop {
+                if self.interrupted.swap(false, Ordering::AcqRel) {
+                    return 0;
+                }
+                if self.filled.load(Ordering::Acquire) > 0 {
+                    break;
+                }
+                inner = self.data_avail.wait(inner).unwrap();
             }
-            if self.filled.load(Ordering::Acquire) > 0 {
-                break;
-            }
-            inner = self.data_avail.wait(inner).unwrap();
-        }
-        let n = self.copy_out(&mut inner, buf);
+            let n = self.copy_out(&mut inner, buf);
+            drop(inner);
+            n
+        };
         self.space_avail.notify_one();
-        n
+        inner
     }
 
     /// Non-blocking [`pop`](Self::pop): returns 0 immediately when the ring
     /// is empty (used by the mixer, which must never stall on a dry client).
     pub fn try_pop(&self, buf: &mut [u8]) -> usize {
-        let mut inner = self.inner.lock().unwrap();
-        if self.interrupted.swap(false, Ordering::AcqRel) {
-            return 0;
-        }
-        if self.filled.load(Ordering::Acquire) == 0 {
-            return 0;
-        }
-        let n = self.copy_out(&mut inner, buf);
+        let n = {
+            let mut inner = self.inner.lock().unwrap();
+            if self.interrupted.swap(false, Ordering::AcqRel) {
+                return 0;
+            }
+            if self.filled.load(Ordering::Acquire) == 0 {
+                return 0;
+            }
+            let n = self.copy_out(&mut inner, buf);
+            drop(inner);
+            n
+        };
         self.space_avail.notify_one();
         n
     }

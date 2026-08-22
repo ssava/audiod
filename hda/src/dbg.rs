@@ -5,6 +5,15 @@
 
 use std::sync::RwLock;
 
+/// Codec command transport override (`--cmd-engine=`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CmdEngineKind {
+    /// DMA ring buffers (default).
+    Corb,
+    /// Legacy immediate-command interface (IC/IR/IRS).
+    Pio,
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct DebugOpts {
     /// Skip the full link reset during `Controller::open`.
@@ -17,6 +26,9 @@ pub struct DebugOpts {
     pub dump_ring: bool,
     /// Walk and log the codec widget topology (DAC/mixer/pin graph).
     pub dump_topology: bool,
+    /// Force a specific codec command engine. `None` = CORB/RIRB with
+    /// automatic PIO fallback.
+    pub cmd_engine: Option<CmdEngineKind>,
 }
 
 static OPTS: RwLock<Option<DebugOpts>> = RwLock::new(None);

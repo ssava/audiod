@@ -142,6 +142,7 @@ fn try_idle_stop(
 fn mix_loop(mut backend: Backend, rx: mpsc::Receiver<Msg>, live: Arc<AtomicUsize>) {
     info!("mixer started");
     store_output_path(&backend.output_path());
+    let mix_rate = load_config().server.mix_rate.max(1) as i64;
     let mut streams: Vec<Arc<MixerStream>> = Vec::new();
     let mut acc = vec![0i32; CHUNK_FRAMES * 2];
     let mut out = vec![0u8; CHUNK_FRAMES * 4];
@@ -224,7 +225,14 @@ fn mix_loop(mut backend: Backend, rx: mpsc::Receiver<Msg>, live: Arc<AtomicUsize
         let writable =
             (SHIM_SERVER_FRAMES as i64 - delay).clamp(0, CHUNK_FRAMES as i64) as usize;
         if writable == 0 {
-            std::thread::sleep(Duration::from_millis(1));
+            // Ring is at the A-V occupancy target. Sleep until the DAC clock
+            // should have freed a full chunk again instead of polling at
+            // 1 kHz (~900 wakeups/s measured): wait for LPIB to advance by
+            // `delay − (TARGET − CHUNK)` frames, capped to stay responsive
+            // to flushes and newly registered streams.
+            let behind = delay - (SHIM_SERVER_FRAMES as i64 - CHUNK_FRAMES as i64);
+            let ms = ((behind * 1000 / mix_rate).clamp(0, 10)) as u64;
+            std::thread::sleep(Duration::from_millis(ms.saturating_sub(1)));
             continue;
         }
 
@@ -249,15 +257,15 @@ fn mix_loop(mut backend: Backend, rx: mpsc::Receiver<Msg>, live: Arc<AtomicUsize
         }
         stopped = false;
 
-        let gain = state_gain() as f64;
+        let gain = state_gain();
         let muted = STATE.muted.load(Ordering::Acquire);
         let n = writable * 2;
         for (i, v) in acc[..n].iter().enumerate() {
-            let s = if muted { 0.0 } else { *v as f64 * gain };
+            let s = if muted { 0.0f32 } else { *v as f32 * gain };
             let c = s.clamp(-32768.0, 32767.0) as i16;
             out[i * 2..i * 2 + 2].copy_from_slice(&c.to_le_bytes());
         }
-        if let Err(e) = backend.play(4, &out[..n * 2]) {
+        if let Err(e) = backend.push(&out[..n * 2]) {
             error!("mixer: backend play: {}", e);
         }
         if let Ok(d) = backend.delay_frames() {

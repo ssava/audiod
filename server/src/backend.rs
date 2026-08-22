@@ -92,6 +92,27 @@ impl Backend {
         Ok(())
     }
 
+    /// Write straight into the physical DMA ring with NO occupancy-target
+    /// check. For the mixer, which paces itself precisely (`writable =
+    /// clamp(SHIM_SERVER_FRAMES − delay_frames, …)` before every tick):
+    /// re-checking the target here only duplicated MMIO delay reads and,
+    /// whenever the caller's budget raced the DAC clock, spun in 1 ms
+    /// sleeps (~27% of mixer CPU under resampled playback).
+    pub fn push(&mut self, data: &[u8]) -> io::Result<()> {
+        debug_assert!(data.len().is_multiple_of(audhda::stream::FRAME_BYTES));
+        let mut off = 0;
+        while off < data.len() {
+            let n = self.0.play(&data[off..]);
+            if n == 0 {
+                // Physical ring momentarily full; brief backoff (cannot spin).
+                std::thread::sleep(std::time::Duration::from_micros(500));
+            } else {
+                off += n;
+            }
+        }
+        Ok(())
+    }
+
     pub fn delay_frames(&mut self) -> io::Result<i64> {
         Ok(self.0.delay_frames())
     }

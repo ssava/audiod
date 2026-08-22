@@ -1,14 +1,15 @@
 //! audhda — minimal userspace Intel HD-Audio driver.
 //!
 //! Replaces the kernel ALSA ioctl path in `audiod` with direct BAR
-//! programming: link reset, PIO command/response, a single playback SD, a
-//! pinned DMA ring, and a Realtek ALC269VC codec setup.
+//! programming: link reset, CORB/RIRB DMA command/response (PIO fallback), a
+//! single playback SD, a pinned DMA ring, and a Realtek ALC269VC codec setup.
 //!
 //! Requires CAP_SYS_ADMIN (root) for BAR mmap + pagemap PFN reads, and for
 //! the kernel HDA driver to be unbound from the PCI device.
 
 pub mod bdl;
 pub mod codec;
+pub mod corb;
 pub mod controller;
 pub mod dbg;
 pub mod mmio;

@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "audcommon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "toml",
@@ -71,7 +71,7 @@ dependencies = [
 
 [[package]]
 name = "audhda"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "log",
@@ -79,7 +79,7 @@ dependencies = [
 
 [[package]]
 name = "audiod"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "audcommon",
  "audhda",
@@ -90,14 +90,14 @@ dependencies = [
 
 [[package]]
 name = "audiod-ctl"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "audcommon",
 ]
 
 [[package]]
 name = "audshim"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "audcommon",
  "env_logger",

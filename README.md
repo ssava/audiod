@@ -72,7 +72,7 @@ LD_PRELOAD=./target/release/libaudshim.so mpv video.mp4
 Replaces the kernel ALSA ioctl path with direct BAR programming:
 
 - Controller bring-up: link reset, PCI bus master enable, codec detect via STATESTS
-- PIO command/response (IC/IR/IRS) — no CORB/RIRB
+- CORB/RIRB DMA command engine (default) with PIO immediate-command fallback (`--cmd-engine=pio`)
 - Single playback stream descriptor (SD0) with a 64-page (256 KiB) pinned DMA ring
 - Realtek ALC269VC codec init: DAC→Mux→Pin for speaker and headphone paths
 - Rate encoding: any `base*mult/div` expressible rate (8 kHz–192 kHz)

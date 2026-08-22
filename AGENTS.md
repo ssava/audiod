@@ -10,6 +10,8 @@ LD_PRELOAD=./target/release/libaudshim.so alsamixer    # Verify no crash
 ```
 
 ## Current Status
+- **CORB/RIRB command engine (2026-08-22)**: codec verbs no longer use the legacy PIO immediate-command interface by default — new `hda/src/corb.rs` implements the DMA ring pair (kernel `snd_hdac_bus_init_cmd_io` sequence: stop engines → program bases → size-negotiate 256→16→2 with readback verify → pulse `CORBRP_RST`/`RIRBWP_RST`, `RINTCNT=1` → enable RIRB before CORB). Both rings share one pinned 4 KiB page (CORB @0, RIRB @1 KiB) via a new `DmaBuffer::read`. Responses polled from RIRBWP (no interrupts); consumption is **increment-before-read, entry 1 first** after reset (spec §4.4.2 / kernel `snd_hdac_bus_get_response`), software RP vs hardware WP with wrap at the negotiated count. Routed entries: solicited-for-CAD → FIFO (`pending`), unsolicited bit (resp_ex bit 4) → warn log (jack-detect groundwork), foreign CAD → warn+drop. `controller.rs`: `cmd`/`cmd_quiet` deduped into one dispatching `verb_raw` over an internal `CmdEngine { Corb, Pio }`; sticky auto-degrade to PIO after 3 consecutive RIRB timeouts or any hard ring error (re-issues the timed-out verb once via PIO — verbs are idempotent round-trips; `pio_fallback_done` prevents ping-pong). New flag `--cmd-engine=pio|corb` in `server/src/main.rs` + `audhda::dbg::CmdEngineKind`. 8 pure unit tests in corb.rs (wraparound 255→0 and count-16 rings, unsolicited/foreign routing, out-of-range WP panic, ordering). Build/clippy clean, 10/10 audhda tests pass. Live bring-up on real hardware still pending.
+- **Server profiling pass (2026-08-22)**: perf + heaptrack (custom zstd parser, `heaptrack_print` broken by Arch boost 1.91/1.92 partial upgrade) on scripted real-time socket feeders (48k S16 direct-path + 44.1k sinc-resampler workloads). Findings → fixes, all measured: (1) **double pacing**: mixer computed `writable = clamp(SHIM_SERVER_FRAMES − delay)` per tick, then `Backend::play` re-polled `delay_frames()` MMIO in a 1 ms sleep loop — ~27% of mixer CPU under resampled playback. New `Backend::push()` writes straight into the physical ring with no occupancy re-check; the paced `play` remains for the stdin/wav Player paths. (2) **1 kHz sleep-poll**: mixer's `writable == 0` branch now sleeps the computed LPIB drain time (`(delay − (TARGET−CHUNK))·1000/mix_rate`, capped 10 ms) instead of blind 1 ms polls: wakeups during playback ~900/s → ~110/s. (3) **f32 round trip**: S16-stereo-at-mix-rate clients (the common mpv/Firefox case) now memcpy raw frames into their stream ring ("direct" log tag); gain/mute stay downstream in the mixer, so bit-exact. fold+pack (~8% of CPU) skipped entirely for that case. (4) **Resampler**: consumed history is dropped lazily (`off` prefix counter, memmove only when dead prefix > live tail) instead of `hist.drain(..n)` every call, and the tap loop uses one slice window + zip (single bounds check). Bit-exactness preserved — `chunk_split_invariance` still passes; note the position integer stays anchored at the stream origin and must never be rebased by `off` (that double-count bug cost two test iterations). (5) ring.rs wakes condvar waiters after dropping the mutex; mix-loop gain math moved to f32. Results: 44.1k workload CPU samples/30s 1309→605 (−54%), 48k 908→760 with reader conversion gone; peak live heap already trivial (266 KiB incl. 64 KiB client ring + 48 KiB kernel table per connect — left uncached, connect-only cost). Profiling scaffolding lives in `/tmp/opencode/prof/` (`profile.sh` sudo harness: perf cpu + heaptrack phases; `feeder.py`; `ht_analyze.py`).
 - **Pause-loop fix (2026-08-21)**: pausing a video replayed ~1.4 s of stale audio ("loops 1 time") before going silent. Two compounding causes: (1) the multi-client refactor regressed flush handling — `Cmd::Flush` only cleared the client ring and no longer stopped the DMA (pre-refactor `serve_client` called `Backend::stop_immediate()`); (2) the mixer's idle watchdog sat *behind* the `writable == 0` early-out, and after writes stop, LPIB passes `write_pos` so `delay_bytes()` wraps to ~RING_SIZE → `writable == 0` for a full ring traversal (~1.37 s at 48k S16 stereo), during which the dry timer could not even arm. Live log evidence: two shim `MSG_FLUSH` sends, zero server-side flush logs, single `all streams dry 250ms` stop exactly ~1.46 s after the last flush. Fix (`server/src/mixer.rs`, `server/src/main.rs`): `MixerStream::request_flush()` flag consumed by the mixer each tick — drops that stream's queue and calls `stop_immediate()` immediately when no other stream has audio pending (multi-client safe: other streams keep playing); idle watchdog refactored into `try_idle_stop()` and now runs on EVERY tick based on queue occupancy, immune to the wrap window. Resume path unchanged (`HdaPlayback::start()` re-setups after `drop_all`). Verified: build/clippy clean, 15/15 tests pass.
 - **Idle-stop fix (2026-08-21, live-verified)**: after the last client disconnects, the mixer never stopped the HDA stream — `retain()` evicts the finished stream the same tick its ring empties, while `dry_since` was still `None` from the last data tick, and the `streams.is_empty()` branch only *checked* the dry timer without arming it. Result: DMA kept running and wrapped its 256 KiB ring, replaying the last ~1.4 s forever ("audio loop" with 0 clients). Fix: the empty-registry branch arms the timer itself; `stop_immediate` errors are logged + retried (was `let _ =`); stops are sticky (`stopped` flag cleared only when data flows again) so idle doesn't re-SRST every 250 ms; `STATE.last_delay_frames` zeroes on stop so STATUS reads truthfully. Verified: two 120 s tones mixed concurrently, both disconnect → exactly one "HDA stopped" line, `delay_frames:0`, no loop.
 - **Multi-client mixing (2026-08-21)**: server now mixes concurrent PCM clients into one shared HDA backend. Per-client reader thread (`server/src/client.rs`) → fold to stereo f32 → resample to mix rate → bounded ring; single mixer thread (`server/src/mixer.rs`) owns the `Backend`, sums active rings as i32 with master gain + clamp, paces each stream at `writable = clamp(SHIM_SERVER_FRAMES − delay_frames, 0, CHUNK_FRAMES=1024)` to preserve the A-V sync invariant, and stops the HDA stream after 250 ms all-dry. Resampler: windowed-sinc table 256 phases × 48 taps Blackman (`server/src/dsp.rs`), position tracked as exact integer ratio so chunk splits are bit-exact; `"linear"` fallback via config. Verified by 13 dsp unit tests: passband flat ±0.5 dB to 18 kHz, image at 33.1 kHz < −50 dB, 96k→48k alias < −50 dB, DC gain unity, chunk-split invariance bit-exact, impulse response sane. **Test-harness lesson**: feed resampler tests interleaved stereo — a mono sine reinterpreted as frame pairs silently doubles every frequency and gives plausible-looking garbage.
@@ -102,25 +104,26 @@ LD_PRELOAD=./target/release/libaudshim.so alsamixer    # Verify no crash
 ```
 common/src/lib.rs:       69
 common/src/config.rs:   102
-common/src/ring.rs:     152
-server/src/main.rs:     876
-server/src/mixer.rs:    222
-server/src/dsp.rs:      453
-server/src/backend.rs:  126
+common/src/ring.rs:     164
+server/src/backend.rs:  147
+server/src/dsp.rs:      471
+server/src/main.rs:     909
+server/src/mixer.rs:    279
 server/src/player.rs:   118
 shim/src/lib.rs:       1484
-hda/src/lib.rs:         163
-hda/src/regs.rs:        105
+hda/src/lib.rs:         164
+hda/src/regs.rs:        121
+hda/src/corb.rs:        348
 hda/src/mmio.rs:         95
-hda/src/pagemap.rs:     147
+hda/src/pagemap.rs:     161
 hda/src/bdl.rs:          44
 hda/src/pcicfg.rs:       94
-hda/src/controller.rs:  284
+hda/src/controller.rs:  354
 hda/src/stream.rs:      307
 hda/src/codec.rs:       345
-hda/src/dbg.rs:          31
+hda/src/dbg.rs:          43
 ctl/src/main.rs:         81
-Total:                5298
+Total:                5900
 
 ## Logging
 - `log` + `env_logger` integrated in both server and shim

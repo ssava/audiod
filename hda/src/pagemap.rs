@@ -128,6 +128,20 @@ impl DmaBuffer {
         }
     }
 
+    /// Read bytes at byte offset `off` into `out`. Panics if the copy
+    /// would extend past the end of the buffer.
+    pub fn read(&self, off: usize, out: &mut [u8]) {
+        let end = off.checked_add(out.len()).expect("read offset overflow");
+        assert!(
+            end <= self.len,
+            "read out of bounds: off={off} len={} end={end}",
+            self.len,
+        );
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.ptr.add(off), out.as_mut_ptr(), out.len());
+        }
+    }
+
     /// Zero the entire buffer.
     pub fn zero(&self) {
         unsafe { std::ptr::write_bytes(self.ptr, 0, self.len) };
